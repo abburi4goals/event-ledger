@@ -1,0 +1,32 @@
+# ─── Maven / build output ──────────────────────────────────────────────
+target/
+*.class
+
+# Maven wrapper internals (keep mvnw / .mvn/wrapper if added later)
+.mvn/timing.properties
+.mvn/wrapper/maven-wrapper.jar
+
+# ─── Java / JVM ─────────────────────────────────────────────────────────
+*.jar
+*.war
+*.ear
+*.log
+hs_err_pid*
+replay_pid*
+
+# ─── IDE / editor ───────────────────────────────────────────────────────
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+
+# ─── OS noise ───────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Claude Code internal (personal/session data — not a deliverable) ────
+.claude/projects/

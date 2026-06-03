@@ -223,3 +223,92 @@ specify it. Worth carrying into the eventual `application.yml`.
 **Next:**
 - Build Account Service (models → repository → service → controller → exception handler)
 - Build Event Gateway (same order, plus AccountServiceClient + circuit breaker + X-Trace-Id interceptor)
+
+---
+
+### [2026-06-02] Session 3 — Entity Scaffold (Model Layer)
+
+**Done:**
+- Scaffolded the full JPA model layer for both services (9 files):
+  - **event-gateway** `model/`: `EventType` enum, `AuditableEntity` (@MappedSuperclass,
+    createdAt/updatedAt), `EventEntity` (eventId @Id = idempotency key, account_id index,
+    BigDecimal(19,4) amount, eventTimestamp vs received_at, metadata TEXT) + `config/JpaConfig`
+    (@EnableJpaAuditing)
+  - **account-service** `model/`: `TransactionType` enum, `AuditableEntity`, `AccountEntity`
+    (lean — account_id + currency only, NO balance column), `TransactionEntity` (surrogate Long id
+    PK + unique event_id, BigDecimal(19,4) amount) + `config/JpaConfig`
+- Followed the reviewed design decisions: derived balance (no stored column), surrogate transaction
+  PK with unique eventId (F5), OffsetDateTime for all timestamps, @Enumerated(STRING), natural-key
+  equals/hashCode, protected no-arg constructors for JPA.
+
+**Caveats / not yet done:**
+- **Build not verified** — no JDK/Maven runtime available in this environment, so `mvn compile`
+  could not be run. Entities written carefully but compilation is unverified.
+- `@EnableJpaAuditing` (JpaConfig) only activates once each service has a `@SpringBootApplication`
+  main class to component-scan it. Until then audit fields won't populate at runtime.
+- Schema does not materialize until main app classes + repositories exist to boot the JPA context
+  (ddl-auto=create-drop generates tables at startup).
+
+**Next:**
+- Add `@SpringBootApplication` main classes for both services
+- Repositories (EventRepository with OrderByEventTimestampAsc; Account/Transaction repos with
+  balance sum query) → then service/controller layers
+
+---
+
+### [2026-06-02] Session 3 — qa-agent / tdd-guide / database-reviewer Review
+
+**Done:**
+- Reviewed the three remaining build/test agents against the design docs + scaffolded POM.
+- **qa-agent.md (had a blocker):**
+  - **BLOCKER** — templates used `@AutoConfigureWireMock` (from `spring-cloud-contract-wiremock`,
+    which is NOT in the POM — POM uses `wiremock-standalone`). Rewrote all integration/circuit
+    templates to the JUnit 5 `WireMockExtension` + `@DynamicPropertySource` pattern so they compile.
+  - Fixed a broken unit-test template (an `AccountService` balance test living inside
+    `EventServiceTest`, referencing undeclared mocks) — split into a proper `AccountServiceTest`.
+  - Corrected the circuit-breaker template: 10-call window / ≥50% rate (not ">=5 failures"); added
+    the design's T-8 assertion that WireMock is NOT called once the circuit is OPEN.
+  - Reconciled the coverage claim — POM enforces **line** 80% only; branch is a tracked target, not
+    a build-failing gate (agent previously claimed both were enforced).
+- **tdd-guide.md:** fixed the wrong circuit threshold ("five consecutive failures") in the T-5
+  comment and in the "Good" test-name example → "failure rate exceeds threshold (10-call window)";
+  added the same WireMock-standalone wiring note.
+- **database-reviewer.md (was the cleanest):** hardened the Account Service DB section to state
+  `accounts` is lean (accountId + currency, NO stored balance column) and `transactions` uses a
+  surrogate `Long id` PK with `event_id` as the unique key (F4/F5 decisions); tightened the
+  BigDecimal checklist to "computed balance" rather than implying a stored balance field.
+
+**Next:**
+- Build Account Service (models → repository → service → controller → exception handler)
+- Build Event Gateway (same order, plus AccountServiceClient + circuit breaker + X-Trace-Id interceptor)
+
+---
+
+### [2026-06-02] Session 3 — dev-agent ↔ Design Doc Reconciliation
+
+**Done:**
+- Reviewed `.claude/agents/dev-agent.md` against all three design docs + reconciled 8 gaps/conflicts
+  that would have produced code contradicting the reviewed design (and failing T-7, T-8, T-10):
+  - **CRITICAL** — Added the ordering invariant (Account Service called BEFORE Gateway DB save)
+  - **CRITICAL** — Added `minimumNumberOfCalls: 10` to the CB guidance; fixed the wrong
+    "circuit opens after 5 consecutive failures" wording → "≥50% failure rate over the 10-call window"
+  - **HIGH** — Added dual trace-header guidance (`traceparent` + explicit `X-Trace-Id` via a
+    `ClientHttpRequestInterceptor` on the Gateway RestTemplate)
+  - **HIGH** — Added `HttpMessageNotReadableException`/`InvalidFormatException` handler
+    (enum/`OffsetDateTime` → field-error body) to the GlobalExceptionHandler example
+  - **HIGH** — Rewrote the handler so response bodies match the documented contract shapes
+    (`{"errors":[...]}`, `{"error":"..."}`, `{"error":"...","code":"DEPENDENCY_UNAVAILABLE"}`)
+    instead of the old `ErrorResponse("VALIDATION_FAILED", ...)` wrapper
+  - **MEDIUM** — Renamed `AccountServiceException` → `ServiceUnavailableException`; removed the
+    spurious `DuplicateEventException` (duplicates return 200, not a thrown exception); added
+    `AccountNotFoundException`
+  - **MEDIUM** — Reconciled audit fields with the lean derived-balance Account model
+    (AccountEntity = accountId + currency only, NO stored balance, NO lastTransactionAt)
+  - **LOW** — Added custom `GET /health` controller to the implementation checklist
+- Added a new "Cross-Service Integration" section to dev-agent (CB config + fallback + X-Trace-Id
+  interceptor) — previously the agent had no guidance for the `client/` and `config/` packages
+- Expanded the implementation checklist with the above as explicit gates
+
+**Next:**
+- Build Account Service (models → repository → service → controller → exception handler)
+- Build Event Gateway (same order, plus AccountServiceClient + circuit breaker + X-Trace-Id interceptor)

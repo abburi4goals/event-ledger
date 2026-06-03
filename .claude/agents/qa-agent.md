@@ -25,7 +25,9 @@ You are the quality assurance agent for the **Event Ledger** project. Your respo
 - Test framework: JUnit 5 + Mockito + Spring Boot Test + WireMock
 - Build tool: Maven — `mvn test`, `mvn jacoco:report`
 - Coverage tool: JaCoCo (configured in parent POM)
-- Required coverage threshold: **80% lines and branches**
+- **Enforced gate:** `jacoco:check` fails the build below **80% line** coverage (BUNDLE rule in the
+  parent POM). Branch coverage is reported and tracked as a target but is NOT a build-failing gate —
+  do not claim the build enforces branch coverage when it does not.
 
 ---
 
@@ -88,45 +90,75 @@ Verify all 12 required tests exist and pass. Check for each:
 
 ## Creating Missing Tests
 
-When a required test does not exist, create it following these templates:
+When a required test does not exist, create it following these templates.
 
-### Unit Test Template
+### WireMock wiring (important — matches the scaffolded POM)
+
+The project depends on `org.wiremock:wiremock-standalone`, **not** `spring-cloud-contract-wiremock`.
+That means `@AutoConfigureWireMock` is **not on the classpath** — do not use it (it would force the
+Spring Cloud release train into the build). Use the JUnit 5 `WireMockExtension` and point the
+Gateway's `account-service.base-url` at the server's dynamic port via `@DynamicPropertySource`:
+
+```java
+@RegisterExtension
+static WireMockExtension wm = WireMockExtension.newInstance()
+    .options(wireMockConfig().dynamicPort())
+    .build();
+
+@DynamicPropertySource
+static void wireMockProps(DynamicPropertyRegistry registry) {
+    registry.add("account-service.base-url", wm::baseUrl);
+}
+```
+
+Call `wm.stubFor(...)` / `wm.verify(...)` (instance methods), not the static `WireMock.stubFor`.
+
+### Unit Test Templates
+
+`EventService` (Gateway) — idempotency short-circuit:
 
 ```java
 @ExtendWith(MockitoExtension.class)
 class EventServiceTest {
 
-    @Mock
-    private EventRepository eventRepository;
-
-    @Mock
-    private AccountServiceClient accountServiceClient;
-
-    @InjectMocks
-    private EventService eventService;
+    @Mock private EventRepository eventRepository;
+    @Mock private AccountServiceClient accountServiceClient;
+    @InjectMocks private EventService eventService;
 
     @Test
     void should_return_existing_event_when_eventId_is_duplicate() {
-        // Arrange
         EventEntity existing = buildEventEntity("evt-001");
         when(eventRepository.findById("evt-001")).thenReturn(Optional.of(existing));
 
-        EventRequest request = buildEventRequest("evt-001");
+        EventResponse response = eventService.submitEvent(buildEventRequest("evt-001"));
 
-        // Act
-        EventResponse response = eventService.submitEvent(request);
-
-        // Assert
         assertThat(response.eventId()).isEqualTo("evt-001");
         verify(accountServiceClient, never()).applyTransaction(any());
-        verify(eventRepository, never()).save(any());
+        verify(eventRepository, never()).save(any());   // duplicate is NEVER saved again
     }
+}
+```
+
+`AccountService` (Account Service) — derived balance (separate class, separate mocks):
+
+```java
+@ExtendWith(MockitoExtension.class)
+class AccountServiceTest {
+
+    @Mock private TransactionRepository transactionRepository;
+    @Mock private AccountRepository accountRepository;
+    @InjectMocks private AccountService accountService;
 
     @Test
     void should_return_zero_balance_when_no_transactions_exist() {
-        when(accountRepository.findBalance("acct-new")).thenReturn(BigDecimal.ZERO);
+        when(transactionRepository.sumAmountByAccountIdAndType("acct-new", TransactionType.CREDIT))
+            .thenReturn(BigDecimal.ZERO);
+        when(transactionRepository.sumAmountByAccountIdAndType("acct-new", TransactionType.DEBIT))
+            .thenReturn(BigDecimal.ZERO);
+
         BigDecimal balance = accountService.getBalance("acct-new");
-        assertThat(balance).isEqualByComparingTo(BigDecimal.ZERO);
+
+        assertThat(balance).isEqualByComparingTo(BigDecimal.ZERO);   // comparesEqualTo, not equals
     }
 }
 ```
@@ -181,20 +213,24 @@ class EventControllerTest {
 
 ```java
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@AutoConfigureWireMock(port = 0)
 class IdempotencyIntegrationTest {
 
-    @Autowired
-    private TestRestTemplate restTemplate;
+    @RegisterExtension
+    static WireMockExtension wm = WireMockExtension.newInstance()
+        .options(wireMockConfig().dynamicPort()).build();
 
-    @Autowired
-    private EventRepository eventRepository;
+    @DynamicPropertySource
+    static void props(DynamicPropertyRegistry registry) {
+        registry.add("account-service.base-url", wm::baseUrl);
+    }
+
+    @Autowired private TestRestTemplate restTemplate;
+    @Autowired private EventRepository eventRepository;
 
     @BeforeEach
     void setUp() {
         eventRepository.deleteAll();
-        // Stub Account Service
-        stubFor(post(urlEqualTo("/accounts/acct-123/transactions"))
+        wm.stubFor(post(urlEqualTo("/accounts/acct-123/transactions"))
             .willReturn(aResponse()
                 .withStatus(201)
                 .withHeader("Content-Type", "application/json")
@@ -205,21 +241,17 @@ class IdempotencyIntegrationTest {
     void should_return_200_and_not_call_account_service_on_duplicate_eventId() {
         EventRequest request = buildEventRequest("evt-dup-001");
 
-        // First submission
         ResponseEntity<EventResponse> first = restTemplate.postForEntity(
             "/events", request, EventResponse.class);
         assertThat(first.getStatusCode()).isEqualTo(HttpStatus.CREATED);
 
-        // Duplicate submission
         ResponseEntity<EventResponse> second = restTemplate.postForEntity(
             "/events", request, EventResponse.class);
         assertThat(second.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(second.getBody().eventId()).isEqualTo("evt-dup-001");
 
-        // Account Service called exactly once
-        verify(postRequestedFor(urlEqualTo("/accounts/acct-123/transactions"))
-            .withHeader("Content-Type", equalTo("application/json")),
-            exactly(1));
+        // Account Service called exactly once across both submissions
+        wm.verify(exactly(1), postRequestedFor(urlEqualTo("/accounts/acct-123/transactions")));
     }
 }
 ```
@@ -228,38 +260,47 @@ class IdempotencyIntegrationTest {
 
 ```java
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
-@AutoConfigureWireMock(port = 0)
 class CircuitBreakerTest {
 
-    @Autowired
-    private TestRestTemplate restTemplate;
+    @RegisterExtension
+    static WireMockExtension wm = WireMockExtension.newInstance()
+        .options(wireMockConfig().dynamicPort()).build();
+
+    @DynamicPropertySource
+    static void props(DynamicPropertyRegistry registry) {
+        registry.add("account-service.base-url", wm::baseUrl);
+    }
+
+    @Autowired private TestRestTemplate restTemplate;
 
     @Test
     void should_open_circuit_after_threshold_failures_and_return_503() {
-        // Stub Account Service to always fail
-        stubFor(post(urlEqualTo("/accounts/acct-123/transactions"))
-            .willReturn(serverError()));
+        wm.stubFor(post(urlPathMatching("/accounts/.*/transactions")).willReturn(serverError()));
 
-        // Fire enough requests to open the circuit (>= 5 failures in 10-call window at 50% threshold)
+        // minimumNumberOfCalls = slidingWindowSize = 10. The circuit is evaluated once 10 calls
+        // are recorded; at 100% failure (>= 50% threshold) it opens. Calls 1-10 each return 503
+        // via the fallback; the circuit is OPEN from call 11 onward.
         for (int i = 0; i < 10; i++) {
             restTemplate.postForEntity("/events", buildEventRequest("evt-cb-" + i), Object.class);
         }
+        wm.resetRequests();   // clear the 10 recorded calls so we can prove no further calls happen
 
-        // Circuit should be open — next call returns 503 immediately
         ResponseEntity<Object> response = restTemplate.postForEntity(
-            "/events", buildEventRequest("evt-cb-10"), Object.class);
+            "/events", buildEventRequest("evt-cb-open"), Object.class);
+
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.SERVICE_UNAVAILABLE);
+        // Circuit OPEN ⇒ fast-fail, Account Service is NOT called (CallNotPermittedException)
+        wm.verify(exactly(0), postRequestedFor(urlPathMatching("/accounts/.*/transactions")));
     }
 
     @Test
     void should_serve_get_events_when_circuit_is_open() {
-        // Arrange: open the circuit
-        stubFor(post(urlEqualTo("/accounts/acct-123/transactions")).willReturn(serverError()));
+        wm.stubFor(post(urlPathMatching("/accounts/.*/transactions")).willReturn(serverError()));
         for (int i = 0; i < 10; i++) {
             restTemplate.postForEntity("/events", buildEventRequest("evt-get-" + i), Object.class);
         }
 
-        // GET /events should still work — does not call Account Service
+        // GET /events reads Gateway DB only — unaffected by circuit state
         ResponseEntity<String> response = restTemplate.getForEntity(
             "/events?account=acct-123", String.class);
         assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
@@ -348,8 +389,8 @@ Before declaring a feature QA-complete:
 
 - [ ] `mvn compile` exits with code 0
 - [ ] `mvn test` — all tests green
-- [ ] JaCoCo line coverage ≥ 80% for both services
-- [ ] JaCoCo branch coverage ≥ 80% for both services
+- [ ] JaCoCo line coverage ≥ 80% for both services (the enforced `jacoco:check` gate)
+- [ ] JaCoCo branch coverage reported; gaps below 80% called out (target, not a hard gate)
 - [ ] All 12 required test cases present and passing (T-U1 to T-I4)
 - [ ] No `Thread.sleep()` in test code (use Awaitility)
 - [ ] No tests with empty `@Test` bodies or `assertTrue(true)` placeholders

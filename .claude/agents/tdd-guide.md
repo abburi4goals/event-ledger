@@ -106,15 +106,22 @@ void should_return_400_when_type_is_unknown() { ... }
 
 ### T-5: Circuit Breaker (WireMock)
 ```java
-// Simulate Account Service returning 500 five times
-// Assert circuit opens → Gateway returns 503
-// Assert GET /events still works while circuit is open
+// Stub Account Service to return 500. The circuit is configured with
+// slidingWindowSize=10, minimumNumberOfCalls=10, failureRateThreshold=50.
+// It opens once 10 calls are recorded and the failure rate is >= 50% —
+// NOT after "5 consecutive failures". Once OPEN it fast-fails (no HTTP call).
+// Assert: Gateway returns 503, and GET /events still works while the circuit is open.
 @Test
-void should_open_circuit_after_threshold_failures_and_return_503() { ... }
+void should_open_circuit_when_failure_rate_exceeds_threshold_and_return_503() { ... }
 
 @Test
 void should_serve_get_events_when_circuit_is_open() { ... }
 ```
+
+> WireMock wiring: depend on `wiremock-standalone` and use the JUnit 5 `WireMockExtension` +
+> `@DynamicPropertySource` (set `account-service.base-url` to `wm.baseUrl()`). Do NOT use
+> `@AutoConfigureWireMock` — it requires `spring-cloud-contract-wiremock`, which is not on the
+> classpath.
 
 ### T-6: Trace Propagation (WireMock)
 ```java
@@ -154,7 +161,7 @@ Use: `should_[expected outcome]_when_[condition]`
 // Good
 void should_return_201_when_valid_event_is_submitted()
 void should_return_400_when_amount_is_zero()
-void should_open_circuit_after_five_consecutive_failures()
+void should_open_circuit_when_failure_rate_exceeds_threshold()
 
 // Bad
 void testSubmitEvent()

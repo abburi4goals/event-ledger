@@ -29,9 +29,14 @@ Tables: `events`
 
 ### Account Service DB (H2, in-memory)
 Tables: `accounts`, `transactions`
+- `accounts` is **lean**: `account_id` (String PK) + `currency` only. There is **NO stored
+  `balance` column** — balance is derived on read (see below). Flag any `balance` column on the
+  `accounts` entity as a design violation.
+- `transactions` uses a **surrogate `Long id` PK** (`@GeneratedValue(strategy = IDENTITY)`); the
+  natural key `event_id` carries the unique constraint. `event_id` is NOT the PK of this table.
 - `transactions.event_id` — unique constraint (secondary idempotency safety net)
 - Balance: derived from `SUM(amount) WHERE type = CREDIT` − `SUM(amount) WHERE type = DEBIT`
-- Must use `BigDecimal` in all amount/balance fields
+- Must use `BigDecimal` in all amount fields and in the computed balance value
 
 ## Core Responsibilities
 
@@ -65,8 +70,8 @@ grep -rn "findBy.*OrderBy\|@Query.*ORDER BY\|Sort\." src/main/java --include="*.
 ### CRITICAL — Financial Data Types
 
 - [ ] `amount` field is `BigDecimal`, not `double`/`float`
-- [ ] `balance` field is `BigDecimal`, not `double`/`float`
-- [ ] Balance arithmetic uses `BigDecimal.add()` / `BigDecimal.subtract()`, not `+` / `-`
+- [ ] Computed balance value is `BigDecimal` (there is no stored balance column to type-check)
+- [ ] Balance arithmetic uses `BigDecimal.subtract()` on the two SUM results, not `+` / `-`
 - [ ] `BigDecimal` scale defined where appropriate (e.g., `HALF_UP` for currency)
 
 ### CRITICAL — Idempotency Constraints

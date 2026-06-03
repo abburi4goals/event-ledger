@@ -46,10 +46,20 @@ event-ledger/
 **Non-negotiable rules:**
 - `BigDecimal` for all monetary values — never `double`/`float`
 - Constructor injection only — never `@Autowired` on fields
-- Idempotency check is the FIRST operation in `POST /events` processing
+- In `POST /events`, validation runs first (controller `@Valid`); the idempotency
+  `findById(eventId)` check is the FIRST operation inside the service
+- **Ordering invariant:** the Account Service call happens **BEFORE** the event is saved to the
+  Gateway DB. If the Account Service call fails (or circuit is OPEN), nothing is persisted — the
+  client retries safely because the idempotency key was never stored. Never save first then call.
 - `eventTimestamp` (client-provided) stored separately from `receivedAt` (server-set)
+- Account balance is **derived on read** (`Σ CREDIT − Σ DEBIT` via JPQL) — there is NO stored
+  `balance` column. The `transactions` ledger is the single source of truth.
 - Every log line includes `traceId` via SLF4J MDC
-- Circuit breaker wraps every call from Gateway to Account Service
+- Circuit breaker wraps every call from Gateway to Account Service, and the
+  `accountService` instance MUST set `minimumNumberOfCalls: 10` (Resilience4j defaults it to 100,
+  which would prevent the circuit from ever opening in a 10-call window)
+- The Gateway propagates **both** `traceparent` (W3C, Micrometer) and an explicit `X-Trace-Id`
+  header to the Account Service — `X-Trace-Id` is the header the tests assert on (see ADR-004)
 
 ---
 
@@ -76,7 +86,21 @@ For every feature, follow this exact order:
 
 ### Global Exception Handler (both services)
 
-Every service must have a `GlobalExceptionHandler` annotated with `@RestControllerAdvice`:
+Every service must have a `GlobalExceptionHandler` annotated with `@RestControllerAdvice`.
+
+**The response body shapes are part of the API contract (see `docs/design/system-overview.md` §6
+and §8) — match them exactly:**
+
+| Outcome | HTTP | Body shape |
+|---|---|---|
+| Field/validation error | 400 | `{"errors":[{"field":"...","message":"..."}]}` |
+| Not found | 404 | `{"error":"Event not found: id"}` |
+| Dependency unavailable | 503 | `{"error":"...","code":"DEPENDENCY_UNAVAILABLE"}` |
+| Unexpected | 500 | `{"error":"Internal server error"}` (no stack trace, no internal message) |
+
+Use two small response records so the shapes never drift: a `ValidationErrorResponse(List<FieldError> errors)`
+for the 400-field case and a generic `ErrorResponse(String error, String code)` (with `code` nullable)
+for the rest.
 
 ```java
 @RestControllerAdvice
@@ -84,69 +108,107 @@ public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    // 400 — Bean Validation (collects ALL field errors, not first-only)
     @ExceptionHandler(MethodArgumentNotValidException.class)
     @ResponseStatus(HttpStatus.BAD_REQUEST)
-    public ErrorResponse handleValidation(MethodArgumentNotValidException ex) {
+    public ValidationErrorResponse handleValidation(MethodArgumentNotValidException ex) {
         List<FieldError> errors = ex.getBindingResult().getFieldErrors().stream()
             .map(e -> new FieldError(e.getField(), e.getDefaultMessage()))
             .toList();
         log.warn("Validation failed: {}", errors);
-        return new ErrorResponse("VALIDATION_FAILED", errors);
+        return new ValidationErrorResponse(errors);
     }
 
-    @ExceptionHandler(EventNotFoundException.class)
+    // 400 — Jackson could not bind the body. Enum ("type") and OffsetDateTime
+    // ("eventTimestamp") mismatches arrive here as InvalidFormatException BEFORE
+    // Bean Validation runs. Reuse the field-error shape so clients get a uniform body.
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    @ResponseStatus(HttpStatus.BAD_REQUEST)
+    public Object handleUnreadable(HttpMessageNotReadableException ex) {
+        if (ex.getCause() instanceof InvalidFormatException ife && ife.getTargetType() != null) {
+            String field = ife.getPath().isEmpty() ? ""
+                : ife.getPath().get(ife.getPath().size() - 1).getFieldName();
+            if (ife.getTargetType().isEnum()) {
+                return new ValidationErrorResponse(
+                    List.of(new FieldError("type", "type must be CREDIT or DEBIT")));
+            }
+            if (OffsetDateTime.class.equals(ife.getTargetType())) {
+                return new ValidationErrorResponse(List.of(new FieldError(field,
+                    "eventTimestamp must be a valid ISO 8601 datetime")));
+            }
+        }
+        log.warn("Malformed request body: {}", ex.getMessage());
+        return new ErrorResponse("Malformed request body", null);
+    }
+
+    // 404
+    @ExceptionHandler({EventNotFoundException.class, AccountNotFoundException.class})
     @ResponseStatus(HttpStatus.NOT_FOUND)
-    public ErrorResponse handleNotFound(EventNotFoundException ex) {
+    public ErrorResponse handleNotFound(RuntimeException ex) {
         log.warn("Resource not found: {}", ex.getMessage());
-        return new ErrorResponse("NOT_FOUND", ex.getMessage());
+        return new ErrorResponse(ex.getMessage(), null);
     }
 
-    @ExceptionHandler(AccountServiceException.class)
+    // 503 — thrown by the circuit breaker fallback
+    @ExceptionHandler(ServiceUnavailableException.class)
     @ResponseStatus(HttpStatus.SERVICE_UNAVAILABLE)
-    public ErrorResponse handleServiceUnavailable(AccountServiceException ex) {
+    public ErrorResponse handleServiceUnavailable(ServiceUnavailableException ex) {
         log.error("Account Service unavailable: {}", ex.getMessage());
-        return new ErrorResponse("DEPENDENCY_UNAVAILABLE",
-            "Account Service is currently unavailable. Please retry.");
+        return new ErrorResponse(
+            "Account Service is currently unavailable. Please retry later.",
+            "DEPENDENCY_UNAVAILABLE");
     }
 
+    // 500 — catch-all; never expose the internal message or stack trace
     @ExceptionHandler(Exception.class)
     @ResponseStatus(HttpStatus.INTERNAL_SERVER_ERROR)
     public ErrorResponse handleUnexpected(Exception ex) {
         log.error("Unexpected error", ex);
-        // Never expose internal exception message to clients
-        return new ErrorResponse("INTERNAL_ERROR", "An unexpected error occurred.");
+        return new ErrorResponse("Internal server error", null);
     }
 }
 ```
 
+> **Idempotency note:** a duplicate event is NOT an exception. The service returns the existing
+> event with **200 OK** (after `findById`, or by catching `DataIntegrityViolationException` on the
+> concurrent-insert race and re-reading). Do not model duplicates as a thrown exception.
+
 **Rules:**
 - Never return stack traces or raw exception messages to the client
-- Log WARN for expected business errors (validation, not found, duplicate)
-- Log ERROR for unexpected failures and dependency unavailability
+- Log WARN for expected business errors (validation, not found); ERROR for unexpected failures and
+  dependency unavailability
+- Return ALL validation errors in one response (not first-error-only)
 - Always include the trace ID (automatic via MDC)
 
 ### Custom Exceptions
 
-Create typed exceptions for clear error handling:
+Create typed exceptions for clear error handling. Names must match the design docs
+(`event-processing.md` §8, `resiliency-and-observability.md` §8):
 
 ```java
+// Gateway — GET /events/{id} miss
 public class EventNotFoundException extends RuntimeException {
     public EventNotFoundException(String eventId) {
         super("Event not found: " + eventId);
     }
 }
 
-public class AccountServiceException extends RuntimeException {
-    public AccountServiceException(String message) { super(message); }
-    public AccountServiceException(String message, Throwable cause) { super(message, cause); }
-}
-
-public class DuplicateEventException extends RuntimeException {
-    public DuplicateEventException(String eventId) {
-        super("Duplicate event: " + eventId);
+// Account Service — GET /accounts/{id}* miss
+public class AccountNotFoundException extends RuntimeException {
+    public AccountNotFoundException(String accountId) {
+        super("Account not found: " + accountId);
     }
 }
+
+// Gateway — thrown by the @CircuitBreaker fallback; maps to 503
+public class ServiceUnavailableException extends RuntimeException {
+    public ServiceUnavailableException(String message) { super(message); }
+    public ServiceUnavailableException(String message, Throwable cause) { super(message, cause); }
+}
 ```
+
+> Do NOT create a `DuplicateEventException` — duplicates are handled by returning the existing
+> event with 200 OK, not by throwing (see the idempotency note above).
 
 ---
 
@@ -209,6 +271,75 @@ public class EventService {
 - Account balances or amounts at INFO/DEBUG (sensitive financial data)
 - Passwords, tokens, secrets
 - Full request/response bodies at INFO (use DEBUG if needed for troubleshooting)
+
+---
+
+## Cross-Service Integration (Gateway → Account Service)
+
+This section is Gateway-only. The Account Service makes no outbound service calls, so it has no
+client, circuit breaker, or propagation interceptor.
+
+### Circuit Breaker — `AccountServiceClient`
+
+Wrap `applyTransaction()` with `@CircuitBreaker(name = "accountService", fallbackMethod = ...)`.
+The fallback must throw `ServiceUnavailableException` (→ 503), never swallow the failure.
+
+```java
+@CircuitBreaker(name = "accountService", fallbackMethod = "applyTransactionFallback")
+public TransactionResponse applyTransaction(EventRequest request) {
+    // RestTemplate POST /accounts/{accountId}/transactions
+}
+
+// Signature must match the protected method + a trailing Throwable
+private TransactionResponse applyTransactionFallback(EventRequest request, Throwable t) {
+    log.warn("Circuit breaker fallback for accountId={} cause={}",
+        request.accountId(), t.toString());
+    throw new ServiceUnavailableException("Account Service is currently unavailable.", t);
+}
+```
+
+Configuration lives in `event-gateway/src/main/resources/application.yml` (already scaffolded):
+
+```yaml
+resilience4j:
+  circuitbreaker:
+    instances:
+      accountService:
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 10
+        minimumNumberOfCalls: 10        # REQUIRED — default is 100; without this the circuit
+                                        # never opens in a 10-call window and T-8 fails
+        failureRateThreshold: 50
+        waitDurationInOpenState: 30s
+        permittedNumberOfCallsInHalfOpenState: 3
+```
+
+The circuit opens after the failure rate over the 10-call window reaches ≥ 50% — i.e. it is
+evaluated once 10 calls are recorded, NOT after "5 consecutive failures."
+
+### Trace Propagation — both headers
+
+Micrometer auto-propagates the W3C `traceparent` header. The tests (T-10) and CLAUDE.md assert on
+`X-Trace-Id`, which Micrometer does NOT send — so register a thin `ClientHttpRequestInterceptor`
+on the Gateway's `RestTemplate` that copies the current trace id into an explicit `X-Trace-Id`
+header. Both headers carry the same id.
+
+```java
+// config/RestTemplateConfig.java (Gateway)
+@Bean
+RestTemplate accountServiceRestTemplate(RestTemplateBuilder builder, Tracer tracer) {
+    return builder.additionalInterceptors((req, body, ex) -> {
+        var span = tracer.currentSpan();
+        if (span != null) {
+            req.getHeaders().add("X-Trace-Id", span.context().traceId());
+        }
+        return ex.execute(req, body);
+    }).build();
+}
+```
+
+The Account Service reads `traceId` from its MDC (populated by Micrometer from `traceparent`); no
+custom inbound filter is required for tracing to appear in its logs.
 
 ---
 
@@ -278,9 +409,16 @@ public class EventEntity extends AuditableEntity {
 ```
 
 **Audit requirements per entity:**
-- `EventEntity` (Gateway): `createdAt`, `updatedAt`, `receivedAt` (explicit, not auditing)
+- `EventEntity` (Gateway): `createdAt`, `updatedAt` (auditing) + `receivedAt` (explicit, server-set
+  at ingestion — distinct from `createdAt`)
 - `TransactionEntity` (Account Service): `createdAt`, `updatedAt`
-- `AccountEntity` (Account Service): `createdAt`, `updatedAt`, `lastTransactionAt`
+- `AccountEntity` (Account Service): **lean by design** — `accountId` (PK) + `currency` only, plus
+  `createdAt`/`updatedAt` audit fields. It MUST NOT have a stored `balance` column (balance is
+  derived on read — see system-overview.md §5 and the derived-balance ADR) and MUST NOT carry a
+  `lastTransactionAt`. Keeping it free of denormalized state avoids read-modify-write drift.
+
+> Audit fields are additive operational metadata; they do not change the documented business
+> columns in the design data model. Never let an audit field reintroduce a stored balance.
 
 ---
 
@@ -331,13 +469,15 @@ BigDecimal ensures precision required for financial calculations."
 
 git commit -m "feat(gateway): add Resilience4j circuit breaker on AccountServiceClient
 
-Configured with 10-call sliding window, 50% failure threshold, 30s wait.
-Fallback returns 503 Service Unavailable to prevent Gateway thread exhaustion."
+Configured with 10-call sliding window, minimumNumberOfCalls=10, 50% failure
+threshold, 30s wait. Fallback throws ServiceUnavailableException (503) to
+prevent Gateway thread exhaustion."
 
 git commit -m "test(gateway): add WireMock circuit breaker resilience tests
 
-Simulates Account Service returning 500 to verify circuit opens after
-5 consecutive failures and GET endpoints remain unaffected."
+Simulates Account Service returning 500 to verify the circuit opens once the
+failure rate over the 10-call window reaches 50%, and that GET endpoints
+remain unaffected while the circuit is OPEN."
 
 git commit -m "chore(shared): add parent POM with Spring Boot 3 BOM and Java 17"
 ```
@@ -373,19 +513,29 @@ git commit -m "test(gateway): add idempotency integration tests for POST /events
 ## Implementation Checklist (per feature)
 
 - [ ] JPA entity created with audit fields (`createdAt`, `updatedAt`)
+- [ ] `AccountEntity` stays lean — `accountId` + `currency` only, NO stored `balance` column
 - [ ] All monetary fields use `BigDecimal` with `precision=19, scale=4`
+- [ ] Balance derived on read via JPQL `Σ CREDIT − Σ DEBIT` (not a stored/updated field)
 - [ ] All required fields have `@Column(nullable = false)`
 - [ ] Unique constraints on idempotency keys
-- [ ] Repository interface created with correct sort order (`OrderByEventTimestampAsc`)
+- [ ] Repository interface created with correct sort order (`OrderByEventTimestampAsc` for GET
+      /events; `OrderByEventTimestampDesc` for Account Service recent transactions)
 - [ ] Service layer has `@Transactional` on write methods, `@Transactional(readOnly=true)` on reads
-- [ ] Idempotency check is the FIRST operation in event submission
-- [ ] Custom exceptions created for each error scenario
-- [ ] `GlobalExceptionHandler` handles all custom exceptions
+- [ ] Idempotency `findById` is the FIRST operation in the service; Account Service is called
+      BEFORE the event is saved to the Gateway DB
+- [ ] Custom exceptions created (`EventNotFoundException`, `AccountNotFoundException`,
+      `ServiceUnavailableException`) — NO `DuplicateEventException`
+- [ ] `GlobalExceptionHandler` produces the documented body shapes and handles
+      `HttpMessageNotReadableException` (enum/`OffsetDateTime` → field error) and
+      `DataIntegrityViolationException` (idempotency race → 200)
 - [ ] Controller uses `@Valid` on all `@RequestBody` parameters
 - [ ] No business logic in controller — delegates to service immediately
 - [ ] Logback JSON configured with service name and MDC fields
 - [ ] Every service method logs entry at INFO with relevant IDs
-- [ ] Circuit breaker on `AccountServiceClient.applyTransaction()` with fallback
+- [ ] Circuit breaker on `AccountServiceClient.applyTransaction()` with fallback, and
+      `minimumNumberOfCalls: 10` set in `application.yml`
+- [ ] Gateway `RestTemplate` adds the explicit `X-Trace-Id` header alongside `traceparent`
+- [ ] Custom `GET /health` controller on both services (DB `SELECT 1`), not the actuator path
 - [ ] Tests written: unit (Mockito) + controller slice (`@WebMvcTest`) + integration
 - [ ] `mvn test` passes before every commit
 - [ ] Each commit is one logical unit with a conventional commit message
