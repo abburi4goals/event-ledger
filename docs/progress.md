@@ -389,3 +389,60 @@ specify it. Worth carrying into the eventual `application.yml`.
 
 **Next:**
 - Phase 0 contract freeze → dispatch Track A + Track B in parallel (plan now validated + corrected).
+
+---
+
+## Session 6 — Full Implementation: Track A + Track B (2026-06-03)
+
+**Done:**
+- Implemented Account Service end-to-end (A1–A6):
+  - `AccountRepository`, `TransactionRepository` (balance JPQL + deterministic DESC sort)
+  - 8 DTOs as Java 17 records (`TransactionRequest` with Bean Validation, `BalanceResponse`,
+    `AccountResponse`, `TransactionView`, `FieldError`, `ValidationErrorResponse`, `ErrorResponse`,
+    `HealthResponse`)
+  - `AccountNotFoundException` + `GlobalExceptionHandler` — exact contract shapes for 400/404/500;
+    `HttpMessageNotReadableException` → `InvalidFormatException` → field-error shape for
+    enum/OffsetDateTime deserialization failures
+  - `AccountService` — idempotency-first (`existsByEventId`), auto-create account on first txn,
+    derived balance `Σ(CREDIT)−Σ(DEBIT)` via JPQL SUM, `ApplyResult(balance, created)` flag for
+    201 vs 200 at controller layer
+  - `AccountController` (POST 201/200, GET balance, GET account), `HealthController` (SELECT 1)
+  - 16 tests green: 6 unit (Mockito), 6 controller slice (@WebMvcTest), 4 integration
+    (@SpringBootTest); covers T-4 (balance correctness) and T-12 (health)
+
+- Implemented Event Gateway end-to-end (B1–B7):
+  - `EventRepository` — 3-key deterministic sort: `eventTimestamp ASC, received_at ASC, event_id ASC`
+  - 8 DTOs (`EventRequest` Bean Validation all 6 fields, `EventResponse`, `TransactionRequest/Response`,
+    `FieldError`, `ValidationErrorResponse`, `ErrorResponse`, `HealthResponse`)
+  - `RestTemplateConfig` — `ClientHttpRequestInterceptor` adds `X-Trace-Id: span.context().traceId()`
+    alongside Micrometer's auto-propagated W3C `traceparent`
+  - `AccountServiceClient` — `@CircuitBreaker(name="accountService")` with fallback throwing
+    `ServiceUnavailableException`; `minimumNumberOfCalls: 10` already set in `application.yml`
+  - `GlobalExceptionHandler` — same field-error shape for enum/OffsetDateTime; 503 with
+    `DEPENDENCY_UNAVAILABLE` code; no stack traces to clients
+  - `EventService` — idempotency `findById` FIRST; Account Service called BEFORE Gateway DB save
+    (ordering invariant); `receivedAt = OffsetDateTime.now()` set explicitly (not an audit field);
+    metadata `Map<String,Object>` ↔ JSON String via ObjectMapper; `DataIntegrityViolationException`
+    → re-read → 200 (concurrent duplicate race)
+  - `EventController` (POST 201/200/400/503, GET /{id} 200/404, GET ?account= sorted), `HealthController`
+  - 19 tests green: 4 unit (Mockito), 7 controller slice (@WebMvcTest), WireMock integration:
+    `IdempotencyIT` (T-1, T-2), `OutOfOrderIT` (T-3 + tie-break stability), `CircuitBreakerIT`
+    (T-8, T-9), `TracePropagationIT` (T-10), `HealthIT` (T-12 Gateway)
+
+- Full root build: `mvn clean test` → **35/35 tests passing, BUILD SUCCESS** (both modules)
+
+**Decisions / Infrastructure fixes for JDK 26 runtime:**
+- JaCoCo `includes: com/eventledger/**` in parent POM — prevents agent from trying to instrument
+  JDK 26 bootstrap classes (class file version 70, unsupported by ASM in JaCoCo 0.8.12)
+- Surefire `--add-opens java.base/...=ALL-UNNAMED` flags for Mockito instrumentation
+- `mockito-extensions/org.mockito.plugins.MockMaker = mock-maker-subclass` in both modules
+  (Byte Buddy inline mock maker fails on JDK 26 without dynamic attach; subclass mocking works)
+- `DateTimeProvider` bean in both `JpaConfig` classes returning `OffsetDateTime.now()` — Spring
+  Data JPA auditing defaults to `LocalDateTime`, which Hibernate 6 cannot convert to `OffsetDateTime`
+- `spring.jpa.properties.hibernate.jdbc.time_zone: UTC` in both `application.yml` files
+
+**Next:**
+- Review pass: code-reviewer + security-reviewer agents (Phase F reviewers)
+- `mvn clean verify` to confirm JaCoCo coverage gate
+- README.md
+- T-11 end-to-end smoke test via `docker-compose up`
