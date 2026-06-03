@@ -127,6 +127,13 @@
                             <phase>verify</phase>
                             <goals><goal>check</goal></goals>
                             <configuration>
+                                <excludes>
+                                    <!-- Spring Boot main class — no testable logic -->
+                                    <exclude>com/eventledger/**/*Application.class</exclude>
+                                    <!-- JPA entities — getters/setters/equals/hashCode are
+                                         framework boilerplate with no business logic to test -->
+                                    <exclude>com/eventledger/**/model/*Entity.class</exclude>
+                                </excludes>
                                 <rules>
                                     <rule>
                                         <element>BUNDLE</element>

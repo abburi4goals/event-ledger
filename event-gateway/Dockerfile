@@ -15,7 +15,7 @@ COPY event-gateway/src /build/event-gateway/src
 RUN mvn -pl event-gateway -am package -DskipTests -q
 
 # Runtime stage
-FROM eclipse-temurin:17-jre-alpine
+FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
 COPY --from=build /build/event-gateway/target/event-gateway-*.jar app.jar
 

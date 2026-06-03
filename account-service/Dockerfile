@@ -12,7 +12,7 @@ COPY account-service/src /build/account-service/src
 RUN mvn -pl account-service -am package -DskipTests -q
 
 # Runtime stage
-FROM eclipse-temurin:17-jre-alpine
+FROM eclipse-temurin:17-jre-jammy
 WORKDIR /app
 COPY --from=build /build/account-service/target/account-service-*.jar app.jar
 
