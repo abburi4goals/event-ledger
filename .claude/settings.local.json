@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p /Users/abburi/event-ledger/docs)"
+    ],
+    "additionalDirectories": [
+      "/Users/abburi/event-ledger/docs"
+    ]
+  }
+}

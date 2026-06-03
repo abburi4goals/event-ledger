@@ -1,0 +1,58 @@
+services:
+
+  account-service:
+    build:
+      context: .
+      dockerfile: account-service/Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      SPRING_APPLICATION_NAME: account-service
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - event-ledger-net
+
+  event-gateway:
+    build:
+      context: .
+      dockerfile: event-gateway/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      SPRING_APPLICATION_NAME: event-gateway
+      ACCOUNT_SERVICE_URL: http://account-service:8081
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318/v1/traces
+    depends_on:
+      account-service:
+        condition: service_healthy
+    networks:
+      - event-ledger-net
+
+  # ── Bonus: OpenTelemetry Collector + Jaeger ─────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.103.0
+    command: ["--config=/etc/otel-collector-config.yml"]
+    volumes:
+      - ./otel-collector-config.yml:/etc/otel-collector-config.yml:ro
+    ports:
+      - "4318:4318"   # OTLP HTTP
+      - "4317:4317"   # OTLP gRPC
+    networks:
+      - event-ledger-net
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.58
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14250:14250"   # gRPC collector
+    networks:
+      - event-ledger-net
+
+networks:
+  event-ledger-net:
+    driver: bridge
