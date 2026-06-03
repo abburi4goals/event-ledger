@@ -226,6 +226,30 @@ specify it. Worth carrying into the eventual `application.yml`.
 
 ---
 
+### [2026-06-02] Session 3 — Implementation Plan (parallel multi-agent)
+
+**Done:**
+- Created `docs/implementation-plan.md` — phased plan for the remaining build, structured for
+  **parallel development by two dev agents**.
+- Core strategy: Phase 0 freezes the Account Service HTTP contract + shared conventions (blocking
+  gate), then **Track A (account-service) ∥ Track B (event-gateway)** run concurrently with zero
+  file overlap (separate Maven modules; Gateway stubs Account Service via WireMock), then Phase F
+  merges (root verify, true E2E, README).
+- Includes: step tables with exact file paths/deps/risk per track, frozen contract spec, shared
+  error/logging conventions, T-1…T-12 test matrix mapped to track+file+type, agent-orchestration
+  table with review gates, file-ownership map (conflict avoidance), and Definition of Done.
+
+**Decisions:**
+- Standardized on canonical test IDs **T-1…T-12** (from system-overview §10) — resolves the earlier
+  T-U/T-C vs T-1..T-8 numbering drift across agents.
+- Recommend git **worktree** isolation per track so the two agents' mvn/git never contend.
+- Root files (`README.md`, `docs/progress.md`, `pom.xml`) are orchestrator-only during parallel work.
+
+**Next (per the plan):**
+- Phase 0 contract freeze → dispatch Track A + Track B in parallel
+
+---
+
 ### [2026-06-02] Session 3 — Entity Scaffold (Model Layer)
 
 **Done:**
@@ -312,3 +336,56 @@ specify it. Worth carrying into the eventual `application.yml`.
 **Next:**
 - Build Account Service (models → repository → service → controller → exception handler)
 - Build Event Gateway (same order, plus AccountServiceClient + circuit breaker + X-Trace-Id interceptor)
+
+---
+
+## Session 4 — Implementation Plan Validation (2026-06-03)
+
+**Done:**
+- Validated `docs/implementation-plan.md` against all 3 design docs + the committed entity code.
+  Confirmed accurate: frozen Account Service contract (§3.1 ↔ system-overview §6.2), error shapes
+  (§3.2 ↔ §8), T-1…T-12 matrix (↔ §10), the call-before-save ordering invariant (B5), and the
+  idempotency-race handling (DataIntegrityViolation → 200) end-to-end.
+- Fixed 4 genuine gaps the plan was silent on (entity-forced details that would block an agent):
+  1. **B5** — must set `receivedAt = now()` explicitly (it is `nullable=false` and NOT an audit field).
+  2. **B2/B5** — `metadata` is `Map<String,Object>` on request AND response; service serializes
+     Map↔JSON String for the `metadata` column so the body round-trips per §6.1.
+  3. **T-11** — clarified it is a manual/scripted compose check (`scripts/e2e-smoke.sh`), NOT part of
+     `mvn verify`; updated F1/F2 and the test matrix so no agent assumes `mvn verify` covers it.
+  4. **Track B** — added optional `events.received.total` Micrometer counter (design §9), clearly
+     marked droppable / not gated by any T-test.
+
+**Decisions:**
+- Plan is APPROVED to execute as written (with the 4 fixes applied). No structural changes needed —
+  parallelization strategy (Phase 0 freeze → Track A ∥ Track B → Phase F merge) is sound.
+
+**Next:**
+- Phase 0 contract freeze (ratify §3, ~15 min, no code) → dispatch Track A + Track B in parallel.
+
+---
+
+## Session 5 — Out-of-Order Ordering Determinism Fix (2026-06-03)
+
+**Done:**
+- Reviewed out-of-order handling end-to-end. Confirmed the core design is correct: events stored
+  in arrival order with separate `eventTimestamp`/`receivedAt`, sorted on read by `eventTimestamp`,
+  balance = Σ(CREDIT) − Σ(DEBIT) (commutative, order-independent).
+- Found + fixed a genuine flaw: sort was keyed on `eventTimestamp` ALONE, so same-millisecond
+  events (common in mainframe/payment-network batch replays) had non-deterministic listing order
+  across calls and across H2 vs. prod RDBMS. Balance was never affected — listing stability only.
+- Added deterministic tie-break keys:
+  - Gateway: `findByAccountIdOrderByEventTimestampAscReceivedAtAscEventIdAsc`
+    (`ORDER BY event_timestamp ASC, received_at ASC, event_id ASC`).
+  - Account Service: `findByAccountIdOrderByEventTimestampDescEventIdDesc`
+    (no `received_at` column there; unique `event_id` is the tie-break).
+- Strengthened T-3 in the plan to POST two identical-timestamp events and assert stable order.
+- Updated 3 docs: `implementation-plan.md` (A1/B1 + T-3), `event-processing.md` (repo snippet +
+  Out-of-Order section with the rationale + UTC-normalization note), `system-overview.md` (§6.2 DESC
+  history tie-break).
+
+**Decisions:**
+- `event_id` (unique) is the final tie-break guaranteeing total ordering; `received_at` is the
+  intuitive secondary key for the Gateway ("same instant → ingestion order").
+
+**Next:**
+- Phase 0 contract freeze → dispatch Track A + Track B in parallel (plan now validated + corrected).

@@ -281,8 +281,10 @@ without requiring pessimistic locking.
 
 public interface EventRepository extends JpaRepository<EventEntity, String> {
 
-    // Returns events sorted by eventTimestamp ASC — order is enforced here, not in service
-    List<EventEntity> findByAccountIdOrderByEventTimestampAsc(String accountId);
+    // Returns events sorted by eventTimestamp ASC — order is enforced here, not in service.
+    // Secondary keys (received_at, then the unique event_id) give a DETERMINISTIC, stable order
+    // when two events share the same eventTimestamp (e.g. same-millisecond batch replays).
+    List<EventEntity> findByAccountIdOrderByEventTimestampAscReceivedAtAscEventIdAsc(String accountId);
 }
 ```
 
@@ -478,11 +480,24 @@ receivedAt (server-set):            When the Gateway RECEIVED the event
 **Sorting is delegated to the repository layer:**
 
 ```java
-findByAccountIdOrderByEventTimestampAsc(String accountId)
+findByAccountIdOrderByEventTimestampAscReceivedAtAscEventIdAsc(String accountId)
 ```
 
-This generates `ORDER BY event_timestamp ASC` at the SQL level. The service layer receives an
-already-sorted list and returns it directly. No in-memory sorting is performed.
+This generates `ORDER BY event_timestamp ASC, received_at ASC, event_id ASC` at the SQL level. The
+service layer receives an already-sorted list and returns it directly. No in-memory sorting is
+performed.
+
+**Deterministic tie-break (why three sort keys):** `event_timestamp` alone is not unique — upstream
+systems (mainframe batches, payment networks) routinely emit several events stamped with the *same*
+instant. With a single sort key, SQL leaves the order of tied rows undefined, so the same listing
+could come back in different orders across calls or across databases (H2 vs. a production RDBMS).
+Adding `received_at` (ingestion order — the natural intent for "same instant" events) and finally
+the unique `event_id` guarantees a total, stable, repeatable ordering. Note this affects *listing
+determinism only* — balance is an order-independent aggregate (below) and is unaffected.
+
+Because `event_timestamp` and `received_at` are `OffsetDateTime`, Hibernate 6 normalizes them to
+UTC before persisting, so comparison is by true instant — events bearing different timezone offsets
+sort by the moment they actually occurred, not by wall-clock local time.
 
 **Balance correctness:** `balance = Σ(amount WHERE type = CREDIT) − Σ(amount WHERE type = DEBIT)`
 This formula is commutative and associative — the order events arrive in has no effect on the final

@@ -288,9 +288,10 @@ Account is auto-created on first transaction with balance 0.
 #### GET /accounts/{accountId}
 
 Response: 200 OK. The `transactions` array is the account's recent history, sorted by
-`eventTimestamp` **DESC** (most recent first — "recent transactions" per the handout). The
-balance is derived (Σ CREDIT − Σ DEBIT), not read from a stored column. Returns 404 if the
-account does not exist.
+`eventTimestamp` **DESC**, with a `event_id` DESC tie-break so same-timestamp transactions list in a
+deterministic order (most recent first — "recent transactions" per the handout). The balance is
+derived (Σ CREDIT − Σ DEBIT), not read from a stored column. Returns 404 if the account does not
+exist.
 ```json
 {
   "accountId": "acct-123",
