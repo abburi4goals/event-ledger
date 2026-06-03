@@ -109,6 +109,13 @@
                         <execution>
                             <id>prepare-agent</id>
                             <goals><goal>prepare-agent</goal></goals>
+                            <configuration>
+                                <!-- Restrict to our packages so JaCoCo never tries to instrument
+                                     JDK bootstrap classes (incompatible class file version on JDK 26) -->
+                                <includes>
+                                    <include>com/eventledger/**</include>
+                                </includes>
+                            </configuration>
                         </execution>
                         <execution>
                             <id>report</id>
@@ -160,6 +167,12 @@
                             <include>**/*Tests.java</include>
                             <include>**/*IT.java</include>
                         </includes>
+                        <!-- Late-bound argLine includes JaCoCo agent; add-opens needed for Mockito on JDK 17+ -->
+                        <argLine>@{argLine}
+                            --add-opens java.base/java.lang=ALL-UNNAMED
+                            --add-opens java.base/java.util=ALL-UNNAMED
+                            --add-opens java.base/java.time=ALL-UNNAMED
+                        </argLine>
                     </configuration>
                 </plugin>
 
