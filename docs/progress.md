@@ -526,3 +526,33 @@ specify it. Worth carrying into the eventual `application.yml`.
 - `mvn clean verify` to confirm JaCoCo coverage gate
 - README.md
 - T-11 end-to-end smoke test via `docker-compose up`
+
+---
+
+## Session 9 — Async Fallback Queue (2026-06-03)
+
+**Done:**
+- Implemented bonus feature: store-and-forward when Account Service is down
+- `EventStatus` enum (`PROCESSED` / `QUEUED`) — new file in `gateway/model/`
+- `EventEntity` — added `status` column (`VARCHAR(9) NOT NULL`); constructor updated to accept status
+- `EventResponse` record — added `status` field so clients can see processing state
+- `EventRepository` — added `findByStatus(EventStatus)` derived query
+- `EventService` — catches `ServiceUnavailableException` (instead of propagating to 503), saves event with `status=QUEUED`, returns `EventSubmitResult(response, created=true, queued=true)`
+- `EventController` — maps `queued=true` → `202 Accepted` (previously only 201/200)
+- `FallbackQueueProcessor` — new `@Scheduled(fixedDelay=30s)` component; queries QUEUED events, retries each via `AccountServiceClient`; on success updates to PROCESSED; on failure logs WARN and leaves QUEUED for next cycle
+- `GatewayApplication` — added `@EnableScheduling`
+- All 34 tests updated and passing:
+  - `EventServiceTest` — `submitEvent_circuitOpen` test rewritten to assert 202/QUEUED behavior
+  - `EventControllerTest` — fixed `EventResponse` and `EventSubmitResult` constructor calls
+  - `CircuitBreakerIT` — `returns503` test rewritten to `returns202Queued`
+
+**Decisions:**
+- `202 Accepted` (not `503`) when Account Service is down — events are never lost; clients can poll `GET /events/{id}` to see `status` transition from `QUEUED` → `PROCESSED`
+- `EventService` catches `ServiceUnavailableException` directly — keeps the fallback boundary in the service layer where the transaction is managed
+- Retry interval: `fixedDelayString = "${fallback.queue.retry-interval-ms:30000}"` — externally configurable, defaults to 30s; fixed delay (not rate) so retries don't pile up if Account Service is still slow
+- Each `retry()` is its own `@Transactional` — one failure doesn't roll back the whole batch
+
+**Updated docs:**
+- `docs/design/resiliency-and-observability.md` — Goals, §4.3 code placement, new §4.3a async section, degradation table (503 → 202), data model (EventStatus), API contract, exception flow, T-8 test description
+- `docs/design/event-processing.md` — Goals, §4.3 sequence diagram rewritten for async path
+- `docs/design/system-overview.md` — Goals, Non-Goals, POST /events response matrix, T-8 test row

@@ -13,7 +13,7 @@ occurred — not the time it arrived.
 - Process each unique event exactly once, regardless of how many times it is submitted
 - Produce a correct account balance (Σ CREDITs − Σ DEBITs) that is independent of arrival order
 - Return event listings sorted by event occurrence time (eventTimestamp), not ingestion time
-- Fail fast and leave no partial state when the Account Service is unavailable
+- Queue events locally when Account Service is unavailable and forward them when it recovers
 - Return all validation errors in a single 400 response (not first-error-only)
 - Handle concurrent duplicate submissions atomically via database constraint
 
@@ -111,7 +111,7 @@ Client          Gateway          Gateway DB       Account Service
 
 ---
 
-### 4.3 Sequence: POST /events — Account Service Down (circuit OPEN)
+### 4.3 Sequence: POST /events — Async Fallback (Account Service Down)
 
 ```
 Client          Gateway          Gateway DB       Account Service
@@ -126,37 +126,47 @@ Client          Gateway          Gateway DB       Account Service
   │                │  null (new)      │
   │                │  ◄───────────────│
   │                │                  │
-  │                │  [3] CircuitBreaker: state = OPEN
-  │                │      CallNotPermittedException thrown immediately
-  │                │      (no HTTP call made to Account Service)
+  │                │  [3] CircuitBreaker: OPEN or Account Service returns 5xx
+  │                │      Fallback: throws ServiceUnavailableException
   │                │                  │
-  │                │  [4] Fallback method invoked
-  │                │      throws ServiceUnavailableException
+  │                │  [4] EventService CATCHES ServiceUnavailableException
+  │                │      (does NOT propagate to GlobalExceptionHandler)
   │                │                  │
-  │                │  [5] GlobalExceptionHandler maps → 503
-  │                │      event NOT saved to Gateway DB
-  │                │                  │
-  │  503 Service   │                  │
-  │  Unavailable   │                  │
-  │  ◄─────────────│                  │
-  │                │                  │
-  │                │ ...time passes, circuit transitions to HALF_OPEN...
-  │                │                  │
-  │  GET /events   │                  │
-  │  ?account=X    │                  │
-  │  ─────────────►│                  │
-  │                │  findByAccountId │
-  │                │  (sorted by      │
-  │                │   eventTimestamp)│
+  │                │  [5] save event  │
+  │                │  status=QUEUED   │
   │                │  ───────────────►│
-  │                │  [list returned] │
+  │                │  saved           │
   │                │  ◄───────────────│
-  │  200 OK (list) │                  │
+  │                │                  │
+  │  202 Accepted  │                  │
+  │  status=QUEUED │                  │
   │  ◄─────────────│                  │
+  │                │                  │
+  │                │ ...FallbackQueueProcessor runs every 30s...
+  │                │                  │
+  │                │  findByStatus    │
+  │                │  (QUEUED)        │
+  │                │  ───────────────►│
+  │                │  [queued events] │
+  │                │  ◄───────────────│
+  │                │                  │  [Account Service recovered]
+  │                │  POST /accounts/{accountId}/transactions
+  │                │  ──────────────────────────────────────►│
+  │                │  201 Created     │                      │
+  │                │  ◄──────────────────────────────────────│
+  │                │                  │
+  │                │  update status   │
+  │                │  PROCESSED       │
+  │                │  ───────────────►│
 ```
 
+**Status code semantics for POST /events:**
+- `201 Created` — new event, Account Service confirmed → `status: "PROCESSED"`
+- `200 OK` — duplicate event, already in DB → original status returned
+- `202 Accepted` — new event, Account Service down → `status: "QUEUED"`, will be retried
+
 **Graceful degradation:** GET endpoints read only from Gateway DB and are completely unaffected
-by Account Service availability. The circuit breaker guards only the write path.
+by Account Service availability. POST events are now always accepted (202 instead of 503).
 
 ---
 

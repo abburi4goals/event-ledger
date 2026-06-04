@@ -11,7 +11,7 @@ and custom health endpoints that verify database connectivity.
 ## 2. Goals
 
 - Prevent Gateway threads from hanging or exhausting on Account Service failures
-- Provide a clear, retryable 503 response to clients when Account Service is degraded
+- Queue events locally when Account Service is down and forward them automatically when it recovers
 - Allow GET endpoints on the Gateway to work at all times, regardless of Account Service state
 - Give a complete trace of every client request across both services via a shared trace ID
 - Produce machine-parseable (JSON) log output with trace context on every line
@@ -111,7 +111,7 @@ Event Gateway call stack:
   EventController.submitEvent(request)
         │
         ▼
-  EventService.processEvent(request)
+  EventService.submitEvent(request)
         │
         ├── eventRepository.findById(eventId)  ← NO circuit breaker
         │
@@ -121,10 +121,14 @@ Event Gateway call stack:
         │         ├── [OPEN]   → CallNotPermittedException (no HTTP call)
         │         └── [HALF_OPEN] → HTTP POST (probe call)
         │
-        │   fallback: handleAccountServiceUnavailable(ex)
+        │   fallback: applyTransactionFallback(ex)
         │         └── throws ServiceUnavailableException
         │
-        └── eventRepository.save(event)  ← only reached if applyTransaction succeeds
+        ├── [SUCCESS] → eventRepository.save(event, status=PROCESSED)  → 201 Created
+        │
+        └── [ServiceUnavailableException caught] → eventRepository.save(event, status=QUEUED)
+                                                 → 202 Accepted
+                                                 → FallbackQueueProcessor retries async
 ```
 
 **The circuit breaker wraps only `AccountServiceClient.applyTransaction()`.**
@@ -134,17 +138,41 @@ It does NOT wrap:
 - `eventRepository.save()` — local H2
 - `GET /health` — local health check only
 
+### 4.3a Async Fallback Queue
+
+`FallbackQueueProcessor` is a `@Scheduled` Spring component that runs every 30 seconds:
+
+```
+FallbackQueueProcessor.processQueuedEvents()   ← @Scheduled(fixedDelay=30s)
+        │
+        ├── eventRepository.findByStatus(QUEUED)
+        │
+        └── for each queued event:
+              accountServiceClient.applyTransaction(...)
+                ├── [SUCCESS] → event.setStatus(PROCESSED) → save
+                └── [ServiceUnavailableException] → leave as QUEUED, log WARN, retry next cycle
+```
+
+**EventStatus lifecycle:**
+
+```
+POST /events (Account Service UP)   →  status = PROCESSED  →  stored, 201 Created
+POST /events (Account Service DOWN) →  status = QUEUED     →  stored, 202 Accepted
+FallbackQueueProcessor (recovery)   →  status QUEUED → PROCESSED
+```
+
 ### 4.4 Graceful Degradation Table
 
 ```
 ┌─────────────────────────────────┬─────────────────────────┬──────────────────────────────────────┐
 │ Client Request                  │ Account Service State   │ Expected Behavior                    │
 ├─────────────────────────────────┼─────────────────────────┼──────────────────────────────────────┤
-│ POST /events (new event)        │ UP (circuit CLOSED)     │ 201 Created — event stored, balance  │
-│                                 │                         │ updated                               │
+│ POST /events (new event)        │ UP (circuit CLOSED)     │ 201 Created — event stored           │
+│                                 │                         │ (status=PROCESSED), balance updated  │
 ├─────────────────────────────────┼─────────────────────────┼──────────────────────────────────────┤
-│ POST /events (new event)        │ DOWN (circuit OPEN)     │ 503 Service Unavailable — event NOT  │
-│                                 │                         │ stored; client must retry             │
+│ POST /events (new event)        │ DOWN (circuit OPEN)     │ 202 Accepted — event stored          │
+│                                 │                         │ (status=QUEUED); FallbackQueue-      │
+│                                 │                         │ Processor forwards it on recovery    │
 ├─────────────────────────────────┼─────────────────────────┼──────────────────────────────────────┤
 │ POST /events (duplicate)        │ UP or DOWN              │ 200 OK — return original event       │
 │                                 │ (any state)             │ immediately; Account Service NOT     │
@@ -162,8 +190,9 @@ It does NOT wrap:
 └─────────────────────────────────┴─────────────────────────┴──────────────────────────────────────┘
 ```
 
-**Key insight:** Only one scenario is blocked by circuit breaker state: `POST /events` for a new
-(non-duplicate) event. All read paths and duplicate submissions are unaffected.
+**Key insight:** No client request is now hard-blocked by circuit state. `POST /events` for a new
+event is queued when Account Service is down (202) instead of failing (503). All read paths and
+duplicate submissions are unaffected.
 
 **Auth note:** `ApiKeyAuthFilter` runs at `@Order(1)`, before the circuit breaker is ever reached.
 A request with a missing or invalid `X-Api-Key` returns `401` immediately — the circuit breaker
@@ -221,30 +250,63 @@ Redis-backed Bucket4j for shared rate limit state across replicas.
 
 ## 5. Data Model
 
-No additional data model for resiliency — circuit breaker state is held in-memory by Resilience4j.
-The `CallNotPermittedException` thrown when the circuit is OPEN is a transient Java exception, not
-a persisted state.
+### EventStatus Enum (Gateway)
+
+The async fallback queue introduces a `status` column on the `events` table:
+
+| Value | Meaning |
+|---|---|
+| `PROCESSED` | Account Service confirmed the transaction; balance updated |
+| `QUEUED` | Account Service was unavailable; event saved locally, awaiting retry |
+
+`status` is set at INSERT time and updated to `PROCESSED` by `FallbackQueueProcessor` on successful retry. It is also returned in `EventResponse` so clients can poll `GET /events/{id}` to check when a QUEUED event transitions to PROCESSED.
+
+Resilience4j circuit breaker state itself is held in-memory (not persisted). The `CallNotPermittedException` thrown when the circuit is OPEN is a transient Java exception.
 
 Observability data models (log fields) are covered in the Observability section.
 
 ## 6. API Contract
 
-### Circuit Breaker Fallback Response
+### Async Fallback Response (Account Service Down)
 
-When the circuit breaker is OPEN or the Account Service call fails, the fallback returns:
+When the Account Service is unavailable, the event is accepted and queued:
 
 ```json
-HTTP 503 Service Unavailable
+HTTP 202 Accepted
 Content-Type: application/json
 
 {
-  "error": "Account Service is currently unavailable. Please retry later.",
-  "code": "DEPENDENCY_UNAVAILABLE"
+  "eventId": "evt-001",
+  "accountId": "acct-123",
+  "type": "CREDIT",
+  "amount": 100.00,
+  "currency": "USD",
+  "eventTimestamp": "2024-01-15T10:00:00Z",
+  "receivedAt": "2026-06-03T20:00:00Z",
+  "status": "QUEUED"
 }
 ```
 
-The `code` field allows clients to distinguish Account Service unavailability (503) from other
-5xx errors (500 Internal Server Error).
+The `status: "QUEUED"` field signals to the client that the event has been accepted but not yet
+forwarded to the Account Service. The client can poll `GET /events/{id}` and check `status`:
+- `QUEUED` → still pending retry by the background processor
+- `PROCESSED` → Account Service confirmed; balance has been updated
+
+### Normal Success Response
+
+```json
+HTTP 201 Created
+
+{ ..., "status": "PROCESSED" }
+```
+
+### Duplicate Response
+
+```json
+HTTP 200 OK
+
+{ ..., "status": "PROCESSED" }   ← or "QUEUED" if original was queued
+```
 
 ### Health Endpoint — Both Services
 
@@ -360,30 +422,31 @@ Accepted
 
 ## 8. Error Handling Strategy
 
-### Circuit Breaker Exception Flow
+### Circuit Breaker + Async Fallback Exception Flow
 
 ```
-Normal call path:
-AccountServiceClient.applyTransaction()
-  → HTTP POST /accounts/{id}/transactions
-  → returns TransactionResponse (201)
-  → EventService continues to save event
+Normal call path (Account Service UP):
+EventService.submitEvent()
+  → accountServiceClient.applyTransaction()
+      → HTTP POST /accounts/{id}/transactions → 201
+  → event saved with status=PROCESSED
+  → return 201 Created
 
-Circuit OPEN path:
-AccountServiceClient.applyTransaction()
-  → Resilience4j throws CallNotPermittedException
-  → @CircuitBreaker fallback method invoked: handleAccountServiceUnavailable()
-  → fallback throws ServiceUnavailableException
-  → EventService does NOT catch this → propagates to GlobalExceptionHandler
-  → GlobalExceptionHandler maps ServiceUnavailableException → 503 JSON response
-  → Event is NOT saved to Gateway DB
+Fallback path (Account Service DOWN or circuit OPEN):
+EventService.submitEvent()
+  → accountServiceClient.applyTransaction()
+      → [circuit OPEN]  Resilience4j throws CallNotPermittedException → fallback
+      → [HTTP 500/timeout] RestTemplate throws → Resilience4j records failure → fallback
+      → fallback: applyTransactionFallback() throws ServiceUnavailableException
+  → EventService CATCHES ServiceUnavailableException
+  → event saved with status=QUEUED
+  → return 202 Accepted (body contains status="QUEUED")
 
-Account Service HTTP error path (500/timeout):
-AccountServiceClient.applyTransaction()
-  → RestTemplate throws HttpServerErrorException / ResourceAccessException
-  → Resilience4j records this as a failure (increments failure counter)
-  → @CircuitBreaker fallback method invoked
-  → Same path as circuit OPEN → 503 returned
+Background retry (FallbackQueueProcessor, every 30s):
+  → eventRepository.findByStatus(QUEUED)
+  → for each: accountServiceClient.applyTransaction()
+      → [SUCCESS] → event.status = PROCESSED → save → log INFO
+      → [FAIL]    → leave QUEUED → log WARN → retry next cycle
 ```
 
 ### Health Check DB Verification
@@ -603,18 +666,15 @@ circuit is OPEN without querying Actuator metrics directly.
 ### Circuit Breaker Tests (WireMock)
 
 ```
-T-8: Circuit Breaker — Opens on sustained failure
+T-8: Async Fallback — Events queued when Account Service is down
   Setup:
     - WireMock stubs POST /accounts/*/transactions to return HTTP 500
-    - Test submits unique events (minimumNumberOfCalls = slidingWindowSize = 10)
   Assert:
-    - Calls 1–10: 503 (Account Service returns 500; each call recorded as a failure,
-      but the circuit stays CLOSED until minimumNumberOfCalls (10) is reached)
-    - After the 10th recorded call, failure rate (100% ≥ 50%) is evaluated → circuit → OPEN
-    - Call 11 onward: 503 with "DEPENDENCY_UNAVAILABLE" code, WireMock NOT called
-      (CallNotPermittedException — no HTTP call made)
-  Note: minimumNumberOfCalls MUST be configured (default 100), otherwise the circuit
-  never opens within this test and the assertion fails.
+    - POST /events returns 202 Accepted (not 503)
+    - Response body contains "status": "QUEUED"
+    - At least some requests are queued (circuitOpenCount or queuedCount > 0)
+  Note: With async fallback, events are never lost when Account Service is down —
+  they are stored as QUEUED and retried by FallbackQueueProcessor.
 
 T-9: Circuit Breaker — GET endpoints unaffected
   Setup: same WireMock stub (Account Service down), circuit OPEN

@@ -28,7 +28,9 @@ public class EventController {
     @PostMapping
     public ResponseEntity<EventResponse> submitEvent(@Valid @RequestBody EventRequest request) {
         EventService.EventSubmitResult result = eventService.submitEvent(request);
-        HttpStatus status = result.created() ? HttpStatus.CREATED : HttpStatus.OK;
+        HttpStatus status = result.queued() ? HttpStatus.ACCEPTED
+                : result.created() ? HttpStatus.CREATED
+                : HttpStatus.OK;
         return ResponseEntity.status(status).body(result.response());
     }
 

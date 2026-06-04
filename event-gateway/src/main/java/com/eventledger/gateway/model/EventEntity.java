@@ -59,13 +59,18 @@ public class EventEntity extends AuditableEntity {
     @Column(name = "metadata", columnDefinition = "TEXT")
     private String metadata;
 
+    /** Processing status — PROCESSED once Account Service confirms, QUEUED when it was unavailable. */
+    @Enumerated(EnumType.STRING)
+    @Column(name = "status", nullable = false, length = 9)
+    private EventStatus status;
+
     /** Required by JPA. */
     protected EventEntity() {
     }
 
     public EventEntity(String eventId, String accountId, EventType type, BigDecimal amount,
                        String currency, OffsetDateTime eventTimestamp, OffsetDateTime receivedAt,
-                       String metadata) {
+                       String metadata, EventStatus status) {
         this.eventId = eventId;
         this.accountId = accountId;
         this.type = type;
@@ -74,6 +79,7 @@ public class EventEntity extends AuditableEntity {
         this.eventTimestamp = eventTimestamp;
         this.receivedAt = receivedAt;
         this.metadata = metadata;
+        this.status = status;
     }
 
     public String getEventId() {
@@ -130,6 +136,14 @@ public class EventEntity extends AuditableEntity {
 
     public void setMetadata(String metadata) {
         this.metadata = metadata;
+    }
+
+    public EventStatus getStatus() {
+        return status;
+    }
+
+    public void setStatus(EventStatus status) {
+        this.status = status;
     }
 
     @Override

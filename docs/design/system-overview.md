@@ -14,7 +14,7 @@ the Gateway.
   out of order
 - Guarantee that the same event, submitted N times, has exactly the same effect as submitting it once
 - Provide accurate account balances and chronologically sorted event history at any point
-- Fail fast (503) on Account Service unavailability rather than hanging or corrupting state
+- Queue events locally on Account Service unavailability and forward them automatically on recovery
 - Keep every log line traceable across both services with a shared trace ID
 - Be independently runnable: each service starts and stops without the other
 
@@ -26,7 +26,7 @@ the Gateway.
 - Persistent storage beyond H2 in-memory databases (assessment scope)
 - OAuth2 / JWT or role-based access control (API key auth is implemented; see §4.2)
 - Pagination of event listings
-- Asynchronous event queuing or store-and-forward (bonus item, not in base scope)
+- Asynchronous persistent queuing to an external broker (Kafka, SQS — H2-backed local queue is implemented)
 
 ## 4. Architecture
 
@@ -248,10 +248,10 @@ Response matrix:
 | Scenario                          | Status | Body                                    |
 |-----------------------------------|--------|-----------------------------------------|
 | Missing or invalid X-Api-Key      | 401    | `{"error":"Invalid or missing API key","code":"UNAUTHORIZED"}` |
-| New valid event, Account Svc up   | 201    | Full event object                       |
-| Duplicate eventId                 | 200    | Original event object (first 201 body)  |
+| New valid event, Account Svc up   | 201    | Full event object (`"status":"PROCESSED"`) |
+| New valid event, Account Svc down | 202    | Full event object (`"status":"QUEUED"`) — retried by background processor |
+| Duplicate eventId                 | 200    | Original event object (original status) |
 | Missing / invalid field           | 400    | `{"errors":[{"field":"...","message":"..."}]}` |
-| Account Service unavailable       | 503    | `{"error":"Account Service is currently unavailable...","code":"DEPENDENCY_UNAVAILABLE"}` |
 
 #### GET /events/{id}
 
@@ -552,7 +552,7 @@ Micrometer auto-instruments Spring MVC:
 | T-5     | Validation       | @WebMvcTest               | Missing fields → 400 with field error message |
 | T-6     | Validation       | @WebMvcTest               | amount <= 0 → 400                            |
 | T-7     | Validation       | @WebMvcTest               | Unknown type → 400                           |
-| T-8     | Circuit Breaker  | WireMock                  | 5+ failures → circuit opens → 503            |
+| T-8     | Async Fallback   | WireMock                  | Account Svc down → 202 QUEUED, not 503        |
 | T-9     | Circuit Breaker  | WireMock                  | GET /events works when circuit is open        |
 | T-10    | Trace Propagation| WireMock verify           | X-Trace-Id header sent to Account Service     |
 | T-11    | Integration      | @SpringBootTest full stack| POST → Account Svc → GET balance reflects txn |
