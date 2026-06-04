@@ -22,6 +22,12 @@ spring:
     console:
       enabled: false
 
+# Set GATEWAY_API_KEY env var in production — default is intentionally weak for local dev/tests
+gateway:
+  api-key: ${GATEWAY_API_KEY:test-api-key-secret}
+  rate-limit:
+    requests-per-second: ${GATEWAY_RATE_LIMIT_RPS:60}
+
 # Account Service base URL (override via env var in Docker Compose)
 account-service:
   base-url: ${ACCOUNT_SERVICE_URL:http://localhost:8081}

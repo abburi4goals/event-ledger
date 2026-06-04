@@ -24,7 +24,7 @@ the Gateway.
 - Overdraft protection or credit limits
 - External client access to the Account Service (it is internal-only)
 - Persistent storage beyond H2 in-memory databases (assessment scope)
-- Rate limiting or authentication on the public API
+- OAuth2 / JWT or role-based access control (API key auth is implemented; see §4.2)
 - Pagination of event listings
 - Asynchronous event queuing or store-and-forward (bonus item, not in base scope)
 
@@ -65,6 +65,21 @@ the Gateway.
  │  Inbound HTTP Request (POST /events, GET /events/*, GET /health)     │
  │       │                                                              │
  │       ▼                                                              │
+ │  ┌───────────────────────────────────────────────┐                  │
+ │  │            ApiKeyAuthFilter  @Order(1)        │                  │
+ │  │   Checks X-Api-Key header; 401 if missing/   │                  │
+ │  │   wrong. Bypassed for GET /health.            │                  │
+ │  └────────────────────┬──────────────────────────┘                  │
+ │                       │ (key valid)                                  │
+ │                       ▼                                              │
+ │  ┌───────────────────────────────────────────────┐                  │
+ │  │            RateLimitFilter   @Order(2)        │                  │
+ │  │   Per-client-IP token bucket (Resilience4j); │                  │
+ │  │   429 + Retry-After: 1 if exceeded.           │                  │
+ │  │   Bypassed for GET /health.                   │                  │
+ │  └────────────────────┬──────────────────────────┘                  │
+ │                       │ (within limit)                               │
+ │                       ▼                                              │
  │  ┌───────────────────────────────────────────────┐                  │
  │  │              EventController                  │                  │
  │  │   @RestController, @Valid, Bean Validation    │                  │
@@ -212,6 +227,9 @@ transactions table (Account Service H2 DB)
 
 #### POST /events — Submit a transaction event
 
+Required header: `X-Api-Key: <key>` (see §4.2 — ApiKeyAuthFilter). Requests without a valid
+key are rejected with 401 before reaching any business logic.
+
 Request body:
 ```json
 {
@@ -229,6 +247,7 @@ Response matrix:
 
 | Scenario                          | Status | Body                                    |
 |-----------------------------------|--------|-----------------------------------------|
+| Missing or invalid X-Api-Key      | 401    | `{"error":"Invalid or missing API key","code":"UNAUTHORIZED"}` |
 | New valid event, Account Svc up   | 201    | Full event object                       |
 | Duplicate eventId                 | 200    | Original event object (first 201 body)  |
 | Missing / invalid field           | 400    | `{"errors":[{"field":"...","message":"..."}]}` |
@@ -236,17 +255,22 @@ Response matrix:
 
 #### GET /events/{id}
 
-| Scenario      | Status | Body                             |
-|---------------|--------|----------------------------------|
-| Event found   | 200    | Full event object                |
-| Not found     | 404    | `{"error":"Event not found: id"}`|
+Requires `X-Api-Key` header.
+
+| Scenario              | Status | Body                             |
+|-----------------------|--------|----------------------------------|
+| Missing/invalid key   | 401    | `{"error":"Invalid or missing API key","code":"UNAUTHORIZED"}` |
+| Event found           | 200    | Full event object                |
+| Not found             | 404    | `{"error":"Event not found: id"}`|
 
 #### GET /events?account={accountId}
 
-Response: 200 OK — array sorted by `eventTimestamp` ASC. Empty array if no events.
-Reads Gateway DB only. Works when Account Service is down.
+Requires `X-Api-Key` header. Response: 200 OK — array sorted by `eventTimestamp` ASC.
+Empty array if no events. Reads Gateway DB only. Works when Account Service is down.
 
 #### GET /health (Gateway)
+
+No `X-Api-Key` required — health endpoint is explicitly excluded from auth by `ApiKeyAuthFilter`.
 
 ```json
 { "status": "UP", "service": "event-gateway", "db": "UP" }
@@ -533,6 +557,14 @@ Micrometer auto-instruments Spring MVC:
 | T-10    | Trace Propagation| WireMock verify           | X-Trace-Id header sent to Account Service     |
 | T-11    | Integration      | @SpringBootTest full stack| POST → Account Svc → GET balance reflects txn |
 | T-12    | Health           | @SpringBootTest           | GET /health returns UP when running           |
+| T-13    | Auth             | @SpringBootTest           | Missing X-Api-Key → 401                      |
+| T-14    | Auth             | @SpringBootTest           | Wrong X-Api-Key → 401                        |
+| T-15    | Auth             | @SpringBootTest           | Valid X-Api-Key passes filter (non-401)       |
+| T-16    | Auth             | @SpringBootTest           | GET /health with no key → 200 (bypass)        |
+| T-17    | Rate Limiting    | @SpringBootTest           | Burst >3 req/s → 429 responses returned       |
+| T-18    | Rate Limiting    | @SpringBootTest           | 429 response carries Retry-After: 1 header    |
+| T-19    | Rate Limiting    | @SpringBootTest           | GET /health never rate-limited                |
+| T-20    | Rate Limiting    | @SpringBootTest           | X-Forwarded-For used as per-IP bucket key     |
 
 ## 11. Open Questions
 

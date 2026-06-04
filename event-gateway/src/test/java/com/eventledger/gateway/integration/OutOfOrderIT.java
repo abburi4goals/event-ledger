@@ -66,8 +66,12 @@ class OutOfOrderIT {
         postEvent("evt-ooo-1", "acct-ooo", "2026-05-10T10:00:00Z");  // earliest
         postEvent("evt-ooo-2", "acct-ooo", "2026-05-11T10:00:00Z");  // middle
 
-        ResponseEntity<String> resp = restTemplate.getForEntity(
-                base() + "/events?account=acct-ooo", String.class);
+        HttpHeaders getHeaders = new HttpHeaders();
+        getHeaders.set("X-Api-Key", API_KEY);
+        ResponseEntity<String> resp = restTemplate.exchange(
+                base() + "/events?account=acct-ooo",
+                org.springframework.http.HttpMethod.GET,
+                new HttpEntity<>(getHeaders), String.class);
         assertThat(resp.getStatusCode()).isEqualTo(HttpStatus.OK);
 
         List<Map<String, Object>> events = mapper.readValue(resp.getBody(),
@@ -96,16 +100,23 @@ class OutOfOrderIT {
         postEvent("evt-tie-b", "acct-tie", sameTs);
         postEvent("evt-tie-a", "acct-tie", sameTs);
 
-        ResponseEntity<String> r1 = restTemplate.getForEntity(base() + "/events?account=acct-tie", String.class);
-        ResponseEntity<String> r2 = restTemplate.getForEntity(base() + "/events?account=acct-tie", String.class);
+        HttpHeaders tieHeaders = new HttpHeaders();
+        tieHeaders.set("X-Api-Key", API_KEY);
+        ResponseEntity<String> r1 = restTemplate.exchange(base() + "/events?account=acct-tie",
+                org.springframework.http.HttpMethod.GET, new HttpEntity<>(tieHeaders), String.class);
+        ResponseEntity<String> r2 = restTemplate.exchange(base() + "/events?account=acct-tie",
+                org.springframework.http.HttpMethod.GET, new HttpEntity<>(tieHeaders), String.class);
 
         // Both calls must return the same order
         assertThat(r1.getBody()).isEqualTo(r2.getBody());
     }
 
+    private static final String API_KEY = "test-api-key-secret";
+
     private void postEvent(String eventId, String accountId, String timestamp) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("X-Api-Key", API_KEY);
         String body = String.format("""
                 {
                   "eventId": "%s",

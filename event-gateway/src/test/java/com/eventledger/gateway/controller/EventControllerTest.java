@@ -23,6 +23,8 @@ import org.springframework.test.web.servlet.MockMvc;
 @WebMvcTest(EventController.class)
 class EventControllerTest {
 
+    private static final String API_KEY = "test-api-key-secret";
+
     @Autowired
     private MockMvc mockMvc;
 
@@ -33,6 +35,7 @@ class EventControllerTest {
     @Test
     void postEvent_missingEventId_returns400() throws Exception {
         mockMvc.perform(post("/events")
+                        .header("X-Api-Key", API_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
@@ -52,6 +55,7 @@ class EventControllerTest {
     @Test
     void postEvent_zeroAmount_returns400() throws Exception {
         mockMvc.perform(post("/events")
+                        .header("X-Api-Key", API_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
@@ -71,6 +75,7 @@ class EventControllerTest {
     @Test
     void postEvent_negativeAmount_returns400() throws Exception {
         mockMvc.perform(post("/events")
+                        .header("X-Api-Key", API_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
@@ -90,6 +95,7 @@ class EventControllerTest {
     @Test
     void postEvent_unknownType_returns400() throws Exception {
         mockMvc.perform(post("/events")
+                        .header("X-Api-Key", API_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
@@ -114,6 +120,7 @@ class EventControllerTest {
                 .thenReturn(new EventService.EventSubmitResult(resp, true));
 
         mockMvc.perform(post("/events")
+                        .header("X-Api-Key", API_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
@@ -137,6 +144,7 @@ class EventControllerTest {
                 .thenReturn(new EventService.EventSubmitResult(resp, false));
 
         mockMvc.perform(post("/events")
+                        .header("X-Api-Key", API_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
@@ -155,7 +163,7 @@ class EventControllerTest {
     void getEvent_notFound_returns404() throws Exception {
         when(eventService.getEvent("unknown")).thenThrow(new EventNotFoundException("unknown"));
 
-        mockMvc.perform(get("/events/unknown"))
+        mockMvc.perform(get("/events/unknown").header("X-Api-Key", API_KEY))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.error").value("Event not found: unknown"));
     }
@@ -164,6 +172,7 @@ class EventControllerTest {
     @Test
     void postEvent_badTimestamp_returns400WithFieldError() throws Exception {
         mockMvc.perform(post("/events")
+                        .header("X-Api-Key", API_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {
@@ -185,6 +194,7 @@ class EventControllerTest {
         when(eventService.submitEvent(any())).thenThrow(new RuntimeException("unexpected"));
 
         mockMvc.perform(post("/events")
+                        .header("X-Api-Key", API_KEY)
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {

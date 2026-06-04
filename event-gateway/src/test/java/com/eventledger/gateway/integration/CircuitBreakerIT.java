@@ -74,6 +74,8 @@ class CircuitBreakerIT {
         assertThat(circuitOpenCount).isGreaterThan(0);
     }
 
+    private static final String API_KEY = "test-api-key-secret";
+
     // T-9: GET /events?account= works even when circuit is OPEN
     @Test
     void getEvents_worksWhenCircuitOpen() {
@@ -87,14 +89,19 @@ class CircuitBreakerIT {
         }
 
         // T-9: GET must still work regardless of circuit state
-        ResponseEntity<String> getResp = restTemplate.getForEntity(
-                base() + "/events?account=acct-t9", String.class);
+        HttpHeaders getHeaders = new HttpHeaders();
+        getHeaders.set("X-Api-Key", API_KEY);
+        ResponseEntity<String> getResp = restTemplate.exchange(
+                base() + "/events?account=acct-t9",
+                org.springframework.http.HttpMethod.GET,
+                new HttpEntity<>(getHeaders), String.class);
         assertThat(getResp.getStatusCode()).isEqualTo(HttpStatus.OK);
     }
 
     private HttpEntity<String> jsonEvent(String eventId, String accountId) {
         HttpHeaders h = new HttpHeaders();
         h.setContentType(MediaType.APPLICATION_JSON);
+        h.set("X-Api-Key", API_KEY);
         String body = String.format("""
                 {
                   "eventId": "%s",

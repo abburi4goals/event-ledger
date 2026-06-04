@@ -446,3 +446,83 @@ specify it. Worth carrying into the eventual `application.yml`.
 - `mvn clean verify` to confirm JaCoCo coverage gate
 - README.md
 - T-11 end-to-end smoke test via `docker-compose up`
+
+---
+
+## Session 7 — API Key Authentication on Event Gateway (2026-06-03)
+
+**Done:**
+- Implemented `ApiKeyAuthFilter` (`OncePerRequestFilter`, `@Order(1)`) in
+  `com.eventledger.gateway.filter`:
+  - Checks `X-Api-Key` request header against `gateway.api-key` property on every request
+  - Returns `401 {"error":"Invalid or missing API key","code":"UNAUTHORIZED"}` if missing or wrong
+  - Skips `/health` via `shouldNotFilter()` — health endpoint stays publicly accessible for
+    Docker health checks and ops tooling
+  - Logs `WARN` with request URI on rejection; traceId present in MDC at that point
+- Added `gateway.api-key: ${GATEWAY_API_KEY:test-api-key-secret}` to `application.yml`
+  - Production: override with `GATEWAY_API_KEY` environment variable
+  - Local dev / tests: default `test-api-key-secret` (no test-specific config needed)
+- Added `ApiKeyFilterIT` (6 tests): missing key → 401, wrong key → 401, GET no key → 401,
+  `/health` with no key → 200, valid key passes to endpoint (non-401 response)
+- Updated all existing tests that hit protected endpoints to include `X-Api-Key` header:
+  `IdempotencyIT`, `OutOfOrderIT`, `CircuitBreakerIT`, `TracePropagationIT`, `EventControllerTest`
+  (`HealthIT` untouched — only hits `/health`)
+- Full test suite: **36/36 tests passing, BUILD SUCCESS** (both modules)
+
+**Decisions:**
+- Account Service deliberately left open (no auth changes) — it is internal-only and not
+  publicly reachable in the Docker Compose network
+- `@Order(1)` ensures the filter runs before all other filters (including tracing and logging)
+- `/health` excluded from auth — required for Docker `healthcheck:` and load balancer probes
+- Default property value `test-api-key-secret` doubles as the test constant, so no
+  `src/test/resources/application.yml` override is needed (avoids Maven classpath shadowing
+  the main `application.yml`)
+
+**Next:**
+- Review pass: code-reviewer + security-reviewer agents (Phase F reviewers)
+- `mvn clean verify` to confirm JaCoCo coverage gate
+- README.md
+- T-11 end-to-end smoke test via `docker-compose up`
+
+---
+
+## Session 8 — Rate Limiting on Event Gateway (2026-06-03)
+
+**Done:**
+- Implemented `RateLimitFilter` (`OncePerRequestFilter`, `@Order(2)`) in
+  `com.eventledger.gateway.filter`:
+  - Per-client-IP rate limiting using a `ConcurrentHashMap<String, RateLimiter>` — each IP
+    gets its own Resilience4j `RateLimiter` instance, created lazily on first request
+  - Default limit: 60 requests per second per IP (overridable via `GATEWAY_RATE_LIMIT_RPS`)
+  - Exceeding the limit returns `429 Too Many Requests` with:
+    - `Retry-After: 1` header (matches the 1-second refresh period)
+    - JSON body `{"error":"Rate limit exceeded","code":"TOO_MANY_REQUESTS"}`
+  - Skips `/health` via `shouldNotFilter()` — health probes must never be throttled
+  - Respects `X-Forwarded-For` header for proxied traffic (first IP in chain used as key)
+  - Logs `WARN` with client IP and URI on each rejection (traceId in MDC)
+- Added `gateway.rate-limit.requests-per-second: ${GATEWAY_RATE_LIMIT_RPS:60}` to
+  `application.yml`
+- Added `RateLimitIT` (4 tests, `@TestPropertySource(properties = "gateway.rate-limit.requests-per-second=3")`):
+  - Burst of 10 requests exceeds the 3/sec limit → at least some return 429
+  - Rate-limited response carries `Retry-After: 1` and `TOO_MANY_REQUESTS` body
+  - `/health` endpoint never rate-limited regardless of burst
+  - `X-Forwarded-For` key: a distinct fake IP gets its own fresh 3-req budget
+- Full test suite: **34/34 tests passing, BUILD SUCCESS** (event-gateway)
+
+**Decisions:**
+- `@Order(2)` — runs after `ApiKeyAuthFilter` (`@Order(1)`): unauthenticated requests are
+  rejected first, so rate limit counters are only consumed by valid API key holders
+- Per-IP (not global) rate limiting — prevents a single abusive client from starving others
+- Resilience4j `RateLimiter` reused (already a project dependency) — consistent with the
+  circuit breaker pattern; no new library needed
+- `ConcurrentHashMap.computeIfAbsent` for thread-safe lazy per-IP instance creation
+- `X-Forwarded-For` support included — load balancers/proxies mask the real client IP in
+  `remoteAddr`; using the forwarded header is standard for edge rate limiters
+- In-memory map grows with distinct IPs — acceptable for this service's known client base;
+  production upgrade path is Caffeine TTL cache or Redis
+
+**Next:**
+- Review pass: code-reviewer + security-reviewer agents (Phase F reviewers)
+- `mvn clean verify` to confirm JaCoCo coverage gate
+- README.md
+- T-11 end-to-end smoke test via `docker-compose up`

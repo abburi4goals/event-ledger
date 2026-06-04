@@ -111,9 +111,12 @@ class IdempotencyIT {
         wm.verify(1, postRequestedFor(urlPathMatching("/accounts/acct-idem/transactions")));
     }
 
+    private static final String API_KEY = "test-api-key-secret";
+
     private HttpEntity<String> jsonEntity(String body) {
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("X-Api-Key", API_KEY);
         return new HttpEntity<>(body, headers);
     }
 }

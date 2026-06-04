@@ -55,6 +55,7 @@ class TracePropagationIT {
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("X-Api-Key", "test-api-key-secret");
         String body = """
                 {
                   "eventId": "evt-trace-001",

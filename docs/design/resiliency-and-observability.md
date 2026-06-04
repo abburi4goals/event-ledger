@@ -24,7 +24,7 @@ and custom health endpoints that verify database connectivity.
 - Distributed tracing UI (Jaeger / Zipkin collector — bonus Docker Compose addition)
 - Prometheus remote scraping (bonus — `/actuator/prometheus` endpoint)
 - Alerting rules or SLO definitions
-- Distributed rate limiting
+- Distributed rate limiting (in-memory per-IP rate limiting is implemented; see §4.5)
 
 ## 4. Architecture
 
@@ -164,6 +164,60 @@ It does NOT wrap:
 
 **Key insight:** Only one scenario is blocked by circuit breaker state: `POST /events` for a new
 (non-duplicate) event. All read paths and duplicate submissions are unaffected.
+
+**Auth note:** `ApiKeyAuthFilter` runs at `@Order(1)`, before the circuit breaker is ever reached.
+A request with a missing or invalid `X-Api-Key` returns `401` immediately — the circuit breaker
+call counter is NOT incremented. Only authenticated requests that proceed to `AccountServiceClient`
+affect circuit state.
+
+### 4.5 Rate Limiting
+
+Per-client-IP token bucket, implemented as `RateLimitFilter` (`@Order(2)`) using Resilience4j
+`RateLimiter`. Runs after `ApiKeyAuthFilter` so only authenticated requests consume rate limit
+budget. Skips `/health` (same exemption as the auth filter).
+
+**Configuration (`application.yml`):**
+
+```yaml
+gateway:
+  rate-limit:
+    requests-per-second: ${GATEWAY_RATE_LIMIT_RPS:60}
+```
+
+| Property | Default | Rationale |
+|---|---|---|
+| `requests-per-second` | 60 | 1 request per 16ms — appropriate for a financial event ingestor that batches upstream; tune via `GATEWAY_RATE_LIMIT_RPS` env var |
+| Refresh period | 1s | Token bucket refills fully every second |
+| Timeout | 0ms | Fail immediately when limit exceeded — no queuing |
+| Key | Client IP (X-Forwarded-For first, else remoteAddr) | Per-client isolation; one abusive caller cannot throttle others |
+
+**Response when limit exceeded:**
+
+```
+HTTP 429 Too Many Requests
+Content-Type: application/json
+Retry-After: 1
+
+{"error":"Rate limit exceeded","code":"TOO_MANY_REQUESTS"}
+```
+
+**Filter chain order:**
+```
+Inbound Request
+    │
+    ▼ @Order(1)
+ApiKeyAuthFilter     → 401 if invalid key (rate limit never consumed)
+    │
+    ▼ @Order(2)
+RateLimitFilter      → 429 if per-IP budget exhausted
+    │
+    ▼
+EventController      → business logic
+```
+
+**Production upgrade path:** The in-memory `ConcurrentHashMap` grows with distinct IPs and is
+not evicted. For a multi-instance deployment, replace with a Caffeine cache (TTL eviction) or
+Redis-backed Bucket4j for shared rate limit state across replicas.
 
 ## 5. Data Model
 

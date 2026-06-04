@@ -12,6 +12,28 @@ Wait until both services are healthy (gateway waits for account-service automati
 
 ---
 
+## Authentication
+
+The Event Gateway (port 8080) requires an API key on every request **except** `GET /health`.
+Pass it via the `X-Api-Key` header.
+
+**Local / Docker Compose default key:**
+```bash
+export API_KEY=test-api-key-secret
+```
+
+**Production:** set the `GATEWAY_API_KEY` environment variable in your deployment config.
+The Gateway reads `${GATEWAY_API_KEY}` at startup; any request with a missing or wrong key
+receives `401 Unauthorized`:
+```json
+{ "error": "Invalid or missing API key", "code": "UNAUTHORIZED" }
+```
+
+The Account Service (port 8081) is **internal-only** and has no authentication — it is not
+exposed to external callers and should not be called directly in production.
+
+---
+
 ## Health Checks
 
 ```bash
@@ -32,6 +54,7 @@ Expected response:
 ```bash
 curl -X POST http://localhost:8080/events \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{
     "eventId": "evt-001",
     "accountId": "acc-123",
@@ -49,6 +72,7 @@ Expected: `201 Created`
 ```bash
 curl -X POST http://localhost:8080/events \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{
     "eventId": "evt-001",
     "accountId": "acc-123",
@@ -66,6 +90,7 @@ Expected: `200 OK` with the same body (not 201 — duplicate is detected and not
 ```bash
 curl -X POST http://localhost:8080/events \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{
     "eventId": "evt-002",
     "accountId": "acc-123",
@@ -83,6 +108,7 @@ Expected: `201 Created`
 ```bash
 curl -X POST http://localhost:8080/events \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{
     "eventId": "evt-003",
     "accountId": "acc-123",
@@ -98,7 +124,7 @@ Expected: `201 Created` (older timestamp accepted — out-of-order tolerance)
 
 ### Get Event by ID
 ```bash
-curl http://localhost:8080/events/evt-001
+curl -H "X-Api-Key: $API_KEY" http://localhost:8080/events/evt-001
 ```
 Expected: `200 OK` with event details, `404 Not Found` for unknown IDs
 
@@ -106,7 +132,7 @@ Expected: `200 OK` with event details, `404 Not Found` for unknown IDs
 
 ### Get All Events for an Account (sorted by eventTimestamp ASC)
 ```bash
-curl http://localhost:8080/events?account=acc-123
+curl -H "X-Api-Key: $API_KEY" "http://localhost:8080/events?account=acc-123"
 ```
 Expected: `200 OK` — events sorted by `eventTimestamp` ascending (evt-003 → evt-001 → evt-002)
 
@@ -116,6 +142,7 @@ Expected: `200 OK` — events sorted by `eventTimestamp` ascending (evt-003 → 
 ```bash
 curl -X POST http://localhost:8080/events \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{"eventId": "evt-004", "accountId": "acc-123"}'
 ```
 Expected: `400 Bad Request`
@@ -126,6 +153,7 @@ Expected: `400 Bad Request`
 ```bash
 curl -X POST http://localhost:8080/events \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{
     "eventId": "evt-005",
     "accountId": "acc-123",
@@ -143,6 +171,7 @@ Expected: `400 Bad Request`
 ```bash
 curl -X POST http://localhost:8080/events \
   -H "Content-Type: application/json" \
+  -H "X-Api-Key: $API_KEY" \
   -d '{
     "eventId": "evt-006",
     "accountId": "acc-123",
@@ -153,6 +182,50 @@ curl -X POST http://localhost:8080/events \
   }'
 ```
 Expected: `400 Bad Request`
+
+---
+
+### Authentication Error — Missing API Key
+```bash
+curl -X POST http://localhost:8080/events \
+  -H "Content-Type: application/json" \
+  -d '{"eventId": "evt-007", "accountId": "acc-123", "type": "CREDIT", "amount": 10.00, "currency": "USD", "eventTimestamp": "2024-01-15T13:00:00Z"}'
+```
+Expected: `401 Unauthorized`
+```json
+{ "error": "Invalid or missing API key", "code": "UNAUTHORIZED" }
+```
+
+---
+
+### Rate Limiting — Burst Test
+
+The Gateway allows 60 requests per second per client IP by default (`GATEWAY_RATE_LIMIT_RPS`).
+When exceeded, it returns `429 Too Many Requests` with a `Retry-After: 1` header.
+
+To trigger the limit locally, fire a burst of requests using a loop:
+```bash
+for i in $(seq 1 70); do
+  curl -s -o /dev/null -w "%{http_code}\n" \
+    -H "X-Api-Key: $API_KEY" \
+    http://localhost:8080/events/nonexistent
+done
+```
+Expected: first ~60 responses are `404` (or `200`), remaining responses are `429`.
+
+Check the `Retry-After` header on a 429:
+```bash
+curl -v -H "X-Api-Key: $API_KEY" http://localhost:8080/events/nonexistent 2>&1 | grep -E "< HTTP|Retry-After"
+```
+Expected: `Retry-After: 1`
+
+`GET /health` is **never** rate-limited — it bypasses the filter entirely:
+```bash
+for i in $(seq 1 100); do
+  curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/health
+done
+```
+Expected: all `200`.
 
 ---
 
